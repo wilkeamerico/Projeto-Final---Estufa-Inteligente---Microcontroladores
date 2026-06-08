@@ -1,0 +1,503 @@
+// =========================================================================
+//  PROJETO: ESTUFA INTELIGENTE — ESP32 + OLED SSD1306 I2C
+//  Modo: ACCESS POINT — conecte no Wi-Fi "EstufaAP" → acesse 192.168.4.1
+//  Dashboard Web com sliders de limites, simulação e hierarquia de alarmes
+// =========================================================================
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// -------------------------------------------------------------------------
+//  CONFIGURAÇÃO DO ACCESS POINT
+// -------------------------------------------------------------------------
+const char* ap_ssid     = "EstufaAP";
+const char* ap_password = "estufa1234";
+const IPAddress ap_ip(192, 168, 4, 1);
+
+// -------------------------------------------------------------------------
+//  PINAGEM NO ESP32
+// -------------------------------------------------------------------------
+#define LDR_PIN      34
+#define MQ_PIN       35
+#define RELE_BOMBA   26
+#define RELE_COOLER  27
+#define RELE_LAMPADA 25
+const int buzzer = 12;
+
+DHT dht(4, DHT11);
+
+// -------------------------------------------------------------------------
+//  OLED SSD1306
+// -------------------------------------------------------------------------
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define OLED_ADDRESS  0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// -------------------------------------------------------------------------
+//  PARÂMETROS / LIMITES (Ajustáveis via Web de 0 a 100)
+// -------------------------------------------------------------------------
+float tempLimite  = 45.0; 
+float umidadeMin  = 40.0; 
+int   luminMin    = 1000;
+int   gasLimite   = 2000;
+
+// Trava Crítica de Segurança (>50°C e <30%)
+bool alarmeCriticoTrava = false;
+
+// Controle manual de Atuadores via Web
+bool bombaManual    = false;
+bool bombaModoWeb   = false;
+bool coolerManual   = false;
+bool coolerModoWeb  = false;
+bool lampadaManual  = false;
+bool lampadaModoWeb = false;
+
+// Controle de Simulação
+bool simulaManual   = false; 
+float tempSimulada  = 25.0;
+float umidSimulada  = 50.0;
+
+// Servidor e Leitura
+WebServer server(80);
+float temperatura  = 0;
+float umidade      = 0;
+int   luminosidade = 0;
+int   nivelGas     = 0;
+int   buzzerStatus = 0; // 0=OK, 1=Temp Alta, 2=Umid Baixa, 3=CRÍTICO
+
+// Variáveis de tempo para bipes sem usar delay()
+unsigned long ultimoBip5s  = 0;
+unsigned long ultimoBip10s = 0;
+int estagioBipDuplo = 0;
+
+// =========================================================================
+//  HTML DA PÁGINA WEB
+// =========================================================================
+String buildPage() {
+  bool bombaLig  = (digitalRead(RELE_BOMBA)  == LOW);
+  bool coolerLig = (digitalRead(RELE_COOLER) == LOW);
+  bool lampLig   = (digitalRead(RELE_LAMPADA)== LOW);
+
+  String page = R"rawhtml(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="3">
+<title>Estufa Inteligente — Dashboard</title>
+<style>
+  :root{--verde:#39d353;--amarelo:#e3b341;--vermelho:#f85149;--azul:#58a6ff;
+        --fundo:#010409;--card:#0d1117;--borda:#21262d;--texto:#c9d1d9}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--fundo);color:var(--texto);font-family:'Courier New',monospace;
+       min-height:100vh;padding:16px}
+  h1{text-align:center;color:var(--azul);font-size:1.3rem;letter-spacing:3px;
+     margin-bottom:4px;text-transform:uppercase}
+  .subtitle{text-align:center;font-size:.68rem;color:#484f58;
+            margin-bottom:20px;letter-spacing:2px}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px}
+  @media(min-width:550px){.grid{grid-template-columns:repeat(4,1fr)}}
+  .card{background:var(--card);border:1px solid var(--borda);border-radius:8px;
+        padding:14px;text-align:center;position:relative;overflow:hidden}
+  .card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+  .card.ok::before   {background:var(--verde)}
+  .card.alert::before{background:var(--vermelho)}
+  .card.warn::before {background:var(--amarelo)}
+  .card .label{font-size:.65rem;letter-spacing:2px;color:#8b949e;
+               text-transform:uppercase;margin-bottom:8px}
+  .card .value{font-size:1.9rem;font-weight:bold}
+  .card.ok    .value{color:var(--verde)}
+  .card.alert .value{color:var(--vermelho)}
+  .card.warn  .value{color:var(--amarelo)}
+  .section{background:var(--card);border:1px solid var(--borda);
+           border-radius:8px;padding:14px;margin-bottom:12px}
+  .section h2{font-size:.7rem;letter-spacing:2px;color:#8b949e;
+              text-transform:uppercase;margin-bottom:12px}
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}
+  input[type=number]{background:var(--fundo);border:1px solid var(--borda);
+                     color:var(--texto);border-radius:5px;padding:6px 10px;
+                     width:100px;font-family:inherit}
+  input[type=number]:focus{outline:none;border-color:var(--azul)}
+  
+  /* Sliders */
+  input[type=range]{width: 180px; accent-color: var(--azul); cursor: pointer;}
+  .slider-label{min-width: 220px; display: inline-block; font-size: 0.85rem;}
+
+  .btn{padding:7px 16px;border:1px solid var(--borda);border-radius:6px;cursor:pointer;
+       font-family:inherit;font-size:.8rem;font-weight:bold;letter-spacing:1px;
+       transition:opacity .2s; text-decoration:none;}
+  .btn:hover{opacity:.8}
+  .btn-on  {background:#1a7f37;border-color:var(--verde);color:var(--verde)}
+  .btn-off {background:#3d1a1a;border-color:var(--vermelho);color:var(--vermelho)}
+  .btn-auto{background:#161b22;border-color:var(--borda);color:#8b949e}
+  .btn-save{background:#0d419d;border-color:var(--azul);color:var(--azul);
+            margin-top:6px;padding:8px 24px}
+  .btn-critico{background:#8c1010;border-color:#ff5a5a;color:white; margin-top:10px; width:100%;}
+  .badge{display:inline-block;padding:3px 12px;border-radius:12px;
+         font-size:.72rem;font-weight:bold;letter-spacing:1px}
+  .badge.on {background:#1a7f37;color:var(--verde);border:1px solid var(--verde)}
+  .badge.off{background:#3d1a1a;color:var(--vermelho);border:1px solid var(--vermelho)}
+  .mode-tag{font-size:.62rem;padding:2px 7px;border-radius:4px;
+            background:#21262d;color:#8b949e;margin-left:5px}
+  .alert-text{color:var(--vermelho); font-size:0.75rem; font-weight:bold;}
+  footer{text-align:center;font-size:.66rem;color:#484f58;margin-top:18px}
+</style>
+</head>
+<body>
+<h1>[ Estufa Inteligente ]</h1>
+<p class="subtitle">PAINEL DE CONTROLE, LIMITES E ALARMES</p>
+)rawhtml";
+
+  const char* classTemp = (temperatura > tempLimite) ? "alert" : "ok";
+  const char* classUmid = (umidade < umidadeMin) ? "alert" : "ok";
+  const char* classGas  = (nivelGas > gasLimite) ? "alert" : "ok";
+
+  page += "<div class='grid'>";
+  page += "<div class='card " + String(classTemp) + "'><div class='label'>Temp (Lim:" + String(tempLimite,0) + "C)</div>"
+          "<div class='value'>" + String(temperatura,1) + "<small style='font-size:.85rem'> °C</small></div></div>";
+  page += "<div class='card " + String(classUmid) + "'><div class='label'>Umid (Min:" + String(umidadeMin,0) + "%)</div>"
+          "<div class='value'>" + String(umidade,1) + "<small style='font-size:.85rem'> %</small></div></div>";
+  page += "<div class='card ok'><div class='label'>Luminosidade</div><div class='value'>" + String(luminosidade) + "</div></div>";
+  page += "<div class='card " + String(classGas) + "'><div class='label'>Gás (CO2)</div><div class='value'>" + String(nivelGas) + "</div></div></div>";
+
+  // ALARMES DO BUZZER E RESET CRÍTICO
+  page += "<div class='section'><h2>// Status do Sistema Sonoro (Buzzer) e Travas</h2><div class='row'>";
+  if (alarmeCriticoTrava) {
+    page += "<span class='badge on' style='background:#bc1010; border-color:red; color:white; font-size:0.9rem'>🚨 ALARME CRÍTICO (>50C e <30%) - SISTEMA TRAVADO!</span>";
+    page += "<form action='/resetAlarme' method='GET'><button class='btn btn-critico' type='submit'>DESABILITAR ALARME E AJUSTAR LIMITES</button></form>";
+  } else if (buzzerStatus == 1) {
+    page += "<span class='badge on' style='background:#bc6c25; border-color:orange; color:white;'>⚠️ BIP 5s: TEMP ALTA (Cooler Forçado)</span>";
+  } else if (buzzerStatus == 2) {
+    page += "<span class='badge on' style='background:#bc6c25; border-color:orange; color:white;'>⚠️ BIP DUPLO 10s: UMIDADE BAIXA</span>";
+  } else {
+    page += "<span class='badge off'>SILENCIOSO (ESTÁVEL)</span>";
+  }
+  page += "</div></div>";
+
+  // ESTADO DOS ATUADORES
+  page += "<div class='section'><h2>// Estado Atual dos Atuadores</h2><div class='row'>";
+  page += "<span>Luz:&nbsp;</span><span class='badge " + String(lampLig?"on":"off") + "'>" + String(lampLig?"LIGADA":"DESLIGADA") + "</span><span class='mode-tag'>" + String(lampadaManual?"WEB MANUAL":"AUTO") + "</span>&emsp;";
+  page += "<span>Bomba:&nbsp;</span><span class='badge " + String(bombaLig?"on":"off") + "'>" + String(bombaLig?"LIGADA":"DESLIGADA") + "</span><span class='mode-tag'>" + String(bombaManual?"WEB MANUAL":"AUTO") + "</span>&emsp;";
+  page += "<span>Cooler:&nbsp;</span><span class='badge " + String(coolerLig?"on":"off") + "'>" + String(coolerLig?"LIGADO":"DESLIGADO") + "</span><span class='mode-tag'>" + String(coolerManual?"WEB MANUAL":"AUTO") + "</span>";
+  page += "</div></div>";
+
+  // LIMITES DO SISTEMA (AGORA COM BARRAS DE ROLAGEM 0 a 100)
+  page += "<div class='section'><h2>// Ajuste de Limites (0 a 100)</h2>";
+  page += "<form action='/setlimites' method='GET'>";
+  
+  page += "<div class='row'><label class='slider-label'>Temp Limite (Aciona Cooler/Bip): <strong id='tMaxVal'>" + String(tempLimite,0) + "</strong> °C</label>";
+  page += "<input type='range' name='tmax' min='0' max='100' step='1' value='" + String(tempLimite,0) + "' oninput='document.getElementById(\"tMaxVal\").innerText=this.value'></div>";
+  
+  page += "<div class='row'><label class='slider-label'>Umid Min (Aciona Bip Duplo): <strong id='uMinVal'>" + String(umidadeMin,0) + "</strong> %</label>";
+  page += "<input type='range' name='umin' min='0' max='100' step='1' value='" + String(umidadeMin,0) + "' oninput='document.getElementById(\"uMinVal\").innerText=this.value'></div>";
+
+  page += "<div class='row'><label class='slider-label' style='min-width:160px'>Luminosidade mínima:</label><input type='number' name='lmin' value='" + String(luminMin) + "'></div>";
+  page += "<div class='row'><label class='slider-label' style='min-width:160px'>Limite de CO2 (ADC):</label><input type='number' name='gmax' value='" + String(gasLimite) + "'></div>";
+  
+  page += "<button class='btn btn-save' type='submit'>SALVAR LIMITES</button></form></div>";
+
+  // PAINEL DE SIMULAÇÃO DHT
+  page += "<div class='section'><h2>// Simulação de Sensores (DHT)</h2>";
+  page += "<div class='row'><span>Modo de Operação: </span>";
+  page += "<a href='/simulaModo?tipo=auto'><button class='btn " + String(!simulaManual?"btn-on":"btn-auto") + "'>AUTOMÁTICO</button></a>";
+  page += "<a href='/simulaModo?tipo=manual'><button class='btn " + String(simulaManual?"btn-on":"btn-auto") + "'>MANUAL</button></a></div>";
+  if (simulaManual) {
+    page += "<form action='/setSimulado' method='GET' style='margin-top:10px;'>";
+    page += "<div class='row'><label class='slider-label'>Injetar Temp: <strong id='tSimVal'>" + String(tempSimulada,0) + "</strong> °C</label>";
+    page += "<input type='range' name='tsim' min='0' max='100' step='1' value='" + String(tempSimulada,0) + "' oninput='document.getElementById(\"tSimVal\").innerText=this.value'></div>";
+    page += "<div class='row'><label class='slider-label'>Injetar Umid: <strong id='uSimVal'>" + String(umidSimulada,0) + "</strong> %</label>";
+    page += "<input type='range' name='usim' min='0' max='100' step='1' value='" + String(umidSimulada,0) + "' oninput='document.getElementById(\"uSimVal\").innerText=this.value'></div>";
+    page += "<button class='btn btn-save' type='submit'>DEFINIR SIMULAÇÃO</button></form>";
+  }
+  page += "</div>";
+
+  // ACIONAMENTO MANUAL WEB (COM AVISOS DE OVERRIDE)
+  page += "<div class='section'><h2>// Acionamento Manual Web (Atuadores)</h2>";
+  if(alarmeCriticoTrava) {
+      page += "<p class='alert-text'>BLOQUEADO: Alarme Crítico forçando Bomba e Cooler LIGADOS.</p>";
+  }
+  
+  page += "<div class='row'><label style='min-width:120px'>Iluminação:</label>";
+  page += "<a href='/lampada?estado=on' ><button class='btn btn-on' >LIGAR</button></a>";
+  page += "<a href='/lampada?estado=off'><button class='btn btn-off'>DESLIGAR</button></a>";
+  page += "<a href='/lampada?estado=auto'><button class='btn btn-auto'>AUTO</button></a></div>";
+  
+  page += "<div class='row'><label style='min-width:120px'>Bomba d'água:</label>";
+  page += "<a href='/bomba?estado=on' ><button class='btn btn-on' >LIGAR</button></a>";
+  page += "<a href='/bomba?estado=off'><button class='btn btn-off'>DESLIGAR</button></a>";
+  page += "<a href='/bomba?estado=auto'><button class='btn btn-auto'>AUTO</button></a></div>";
+  
+  page += "<div class='row'><label style='min-width:120px'>Cooler:</label>";
+  if(buzzerStatus == 1 && !alarmeCriticoTrava) page += "<span class='alert-text'>(Cooler forçado ON pela Alta Temp)</span>";
+  else {
+    page += "<a href='/cooler?estado=on' ><button class='btn btn-on' >LIGAR</button></a>";
+    page += "<a href='/cooler?estado=off'><button class='btn btn-off'>DESLIGAR</button></a>";
+    page += "<a href='/cooler?estado=auto'><button class='btn btn-auto'>AUTO</button></a>";
+  }
+  page += "</div></div>";
+
+  page += "<footer>AP: EstufaAP &nbsp;|&nbsp; IP: 192.168.4.1</footer></body></html>";
+  return page;
+}
+
+// =========================================================================
+//  HANDLERS DO SERVIDOR WEB
+// =========================================================================
+void handleRoot() { server.send(200, "text/html", buildPage()); }
+
+void handleSetLimites() {
+  if (server.hasArg("tmax")) tempLimite = server.arg("tmax").toFloat();
+  if (server.hasArg("umin")) umidadeMin = server.arg("umin").toFloat();
+  if (server.hasArg("lmin")) luminMin   = server.arg("lmin").toInt();
+  if (server.hasArg("gmax")) gasLimite  = server.arg("gmax").toInt();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSimulaModo() {
+  if (server.hasArg("tipo")) simulaManual = (server.arg("tipo") == "manual");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSetSimulado() {
+  if (server.hasArg("tsim")) tempSimulada = server.arg("tsim").toFloat();
+  if (server.hasArg("usim")) umidSimulada = server.arg("usim").toFloat();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleBomba() {
+  if(!alarmeCriticoTrava) { // Só aceita comando se não houver trava crítica
+    String e = server.arg("estado");
+    if      (e == "on")  { bombaManual = true; bombaModoWeb = true; }
+    else if (e == "off") { bombaManual = true; bombaModoWeb = false;}
+    else                 { bombaManual = false; }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleCooler() {
+  // Só aceita comando se não houver trava crítica e nem limite de temperatura ativo
+  if(!alarmeCriticoTrava && temperatura <= tempLimite) { 
+    String e = server.arg("estado");
+    if      (e == "on")  { coolerManual = true; coolerModoWeb = true; }
+    else if (e == "off") { coolerManual = true; coolerModoWeb = false;}
+    else                 { coolerManual = false; }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleLampada() {
+  String e = server.arg("estado");
+  if      (e == "on")  { lampadaManual = true; lampadaModoWeb = true; }
+  else if (e == "off") { lampadaManual = true; lampadaModoWeb = false;}
+  else                 { lampadaManual = false; }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleResetAlarme() {
+  // O botão via Web desarma a trava se os valores atuais voltarem à normalidade
+  if (temperatura <= 50.0 && umidade >= 30.0) {
+    alarmeCriticoTrava = false;
+    noTone(buzzer);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// =========================================================================
+//  SETUP
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("Falha ao iniciar OLED SSD1306!");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Estufa Inteligente");
+  display.println("Iniciando AP...");
+  display.display();
+
+  dht.begin();
+
+  pinMode(RELE_BOMBA,   OUTPUT); digitalWrite(RELE_BOMBA,   HIGH);
+  pinMode(RELE_COOLER,  OUTPUT); digitalWrite(RELE_COOLER,  HIGH);
+  pinMode(RELE_LAMPADA, OUTPUT); digitalWrite(RELE_LAMPADA, HIGH);
+  pinMode(buzzer, OUTPUT);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(ap_ip, ap_ip, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ap_ssid, ap_password);
+
+  server.on("/",            handleRoot);
+  server.on("/setlimites",  handleSetLimites);
+  server.on("/simulaModo",  handleSimulaModo);
+  server.on("/setSimulado", handleSetSimulado);
+  server.on("/bomba",       handleBomba);
+  server.on("/cooler",      handleCooler);
+  server.on("/lampada",     handleLampada);
+  server.on("/resetAlarme", handleResetAlarme);
+  server.begin();
+}
+
+// =========================================================================
+//  LOOP
+// =========================================================================
+void loop() {
+  server.handleClient();
+  unsigned long atualMillis = millis();
+
+  // --- SIMULAÇÃO DE SENSORES ---
+  if (simulaManual) {
+    temperatura = tempSimulada;
+    umidade     = umidSimulada;
+  } else {
+    static float dirTemp = 0.5;
+    tempSimulada += dirTemp;
+    if (tempSimulada > 55.0 || tempSimulada < 20.0) dirTemp = -dirTemp;
+    static float dirUmid = -1.0;
+    umidSimulada += dirUmid;
+    if (umidSimulada > 80.0 || umidSimulada < 25.0) dirUmid = -dirUmid;
+    
+    temperatura = tempSimulada;
+    umidade     = umidSimulada;
+  }
+
+  luminosidade = analogRead(LDR_PIN);
+  nivelGas     = analogRead(MQ_PIN);
+
+  // --- LÓGICA DE ALARMES E PRIORIDADES ATUADORES ---
+  
+  // 1. Checa condição para Trava Crítica (T>50 e U<30)
+  if (temperatura > 50.0 && umidade < 30.0) {
+    alarmeCriticoTrava = true;
+  }
+
+  // 2. Executa Ações Baseadas na Hierarquia
+  if (alarmeCriticoTrava) {
+    buzzerStatus = 3;
+    tone(buzzer, 1000); // Toca contínuo
+    digitalWrite(RELE_COOLER, LOW); // FORÇA LIGAR (Sobrepõe manual web)
+    digitalWrite(RELE_BOMBA, LOW);  // FORÇA LIGAR (Sobrepõe manual web)
+  } 
+  else if (temperatura > tempLimite) {
+    buzzerStatus = 1;
+    // Força Cooler LIGADO ignorando ajuste manual
+    digitalWrite(RELE_COOLER, LOW); 
+    
+    // Buzzer bip curto 5s
+    if (atualMillis - ultimoBip5s >= 5000) {
+      ultimoBip5s = atualMillis;
+      tone(buzzer, 1200, 200); 
+    }
+    
+    // Bomba continua operando livre (obedece o web manual ou auto)
+    if (bombaManual) digitalWrite(RELE_BOMBA, bombaModoWeb ? LOW : HIGH);
+    else digitalWrite(RELE_BOMBA, (umidade < umidadeMin) ? LOW : HIGH);
+  } 
+  else if (umidade < umidadeMin) {
+    buzzerStatus = 2;
+    
+    // Buzzer bip duplo a cada 10s
+    if (estagioBipDuplo == 0 && atualMillis - ultimoBip10s >= 10000) {
+      ultimoBip10s = atualMillis;
+      tone(buzzer, 1000, 150);
+      estagioBipDuplo = 1;
+    } else if (estagioBipDuplo == 1 && atualMillis - ultimoBip10s >= 250) { 
+      tone(buzzer, 1000, 150);
+      estagioBipDuplo = 0;
+    }
+
+    // Tanto Bomba quanto Cooler operam livres via Web Manual ou Auto
+    if (coolerManual) digitalWrite(RELE_COOLER, coolerModoWeb ? LOW : HIGH);
+    else digitalWrite(RELE_COOLER, HIGH);
+
+    if (bombaManual) digitalWrite(RELE_BOMBA, bombaModoWeb ? LOW : HIGH);
+    else digitalWrite(RELE_BOMBA, LOW); // Auto padrão: liga porque umidade baixou
+  } 
+  else {
+    // 3. Sistema Operando Normalmente Sem Alarmes
+    buzzerStatus = 0;
+    noTone(buzzer);
+    estagioBipDuplo = 0;
+    
+    if (coolerManual) digitalWrite(RELE_COOLER, coolerModoWeb ? LOW : HIGH);
+    else digitalWrite(RELE_COOLER, HIGH);
+
+    if (bombaManual) digitalWrite(RELE_BOMBA, bombaModoWeb ? LOW : HIGH);
+    else digitalWrite(RELE_BOMBA, HIGH);
+  }
+
+  // Controle Luz (não sofre interferência dos alarmes termo/hídricos)
+  if (lampadaManual) {
+    digitalWrite(RELE_LAMPADA, lampadaModoWeb ? LOW : HIGH);
+  } else {
+    digitalWrite(RELE_LAMPADA, (luminosidade < luminMin) ? LOW : HIGH);
+  }
+
+  // --- LEITURA FINAL DOS PINOS PARA DISPLAY/SERIAL ---
+  bool bombaLig  = (digitalRead(RELE_BOMBA)   == LOW);
+  bool coolerLig = (digitalRead(RELE_COOLER)  == LOW);
+  bool lampLig   = (digitalRead(RELE_LAMPADA) == LOW);
+
+  // --- EXIBIÇÃO NO OLED SSD1306 ---
+  display.clearDisplay();
+  display.setTextSize(1);
+  
+  display.setCursor(0, 0);
+  display.print("T:"); display.print(temperatura,0); display.print("C (L:"); display.print(tempLimite,0); display.println(")");
+  display.print("U:"); display.print(umidade,0); display.print("% (L:"); display.print(umidadeMin,0); display.println(")");
+  
+  display.setCursor(0, 18);
+  display.print("Gas: "); display.print(nivelGas);
+  display.setCursor(64, 18);
+  display.print("Lz:"); display.print(lampLig ? "ON" : "OFF");
+
+  display.setCursor(0, 32);
+  display.print("Col:"); display.print(coolerLig ? "[ON]" : "[OFF]");
+  display.setCursor(64, 32);
+  display.print("Bmb:"); display.print(bombaLig ? "[ON]" : "[OFF]");
+
+  display.setCursor(0, 48);
+  if (alarmeCriticoTrava) display.print("ALARM: CRITICO!!");
+  else if (buzzerStatus == 1) display.print("ALARM: TEMP ALTA");
+  else if (buzzerStatus == 2) display.print("ALARM: UMID BAIXA");
+  else display.print("SISTEMA OK");
+
+  display.display();
+
+  // --- ENVIO PARA O SERIAL MONITOR ---
+  Serial.println("\n=== MONITORAMENTO ESTUFA ===");
+  Serial.printf("Temperatura: %.1f C  | Limite: %.0f C\n", temperatura, tempLimite);
+  Serial.printf("Umidade:     %.1f %% | Minimo: %.0f %%\n", umidade, umidadeMin);
+  Serial.printf("CO2 ADC:     %d\n", nivelGas);
+  Serial.printf("Luz status:  %s\n", lampLig ? "LIGADA" : "DESLIGADA");
+  Serial.printf("Cooler:      %s\n", coolerLig ? "LIGADO" : "DESLIGADO");
+  Serial.printf("Bomba:       %s\n", bombaLig ? "LIGADA" : "DESLIGADA");
+  
+  if (alarmeCriticoTrava) Serial.println("-> ALARME CRÍTICO ATIVADO! T>50 e U<30 (TRAVADO)");
+  else if (buzzerStatus==1) Serial.println("-> ALERTA: Temp Alta (Bip 5s / Cooler Forcado)");
+  else if (buzzerStatus==2) Serial.println("-> ALERTA: Umid Baixa (Bip 10s / Bomba Livre)");
+  else Serial.println("-> Buzzer: Silencioso");
+  Serial.println("============================");
+
+  delay(1000);
+}
