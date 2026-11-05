@@ -28,7 +28,7 @@ const IPAddress ap_ip(192, 168, 4, 1);
 #define RELE_LAMPADA 25
 const int buzzer = 12;
 
-DHT dht(4, DHT11);
+DHT dht(5, DHT11);
 
 // -------------------------------------------------------------------------
 //  OLED SSD1306
